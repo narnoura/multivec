@@ -54,6 +54,34 @@ void MonolingualModel::readVocab(const string& training_file) {
     initUnigramTable();
 }
 
+void MonolingualModel::readLexicon(const string& lexicon_file) {
+    // TODO
+    // reads lexicon and updates the lexicon hashmap of the source model
+    ifstream infile(lexicon_file);
+    std::cout << "Reading sentiment lexicon " << endl;
+
+    try {
+        check_is_open(infile, lexicon_file);
+        check_is_non_empty(infile, lexicon_file);
+    } catch (...) {
+        throw;
+    }
+    // read lines and update sentiment_lexicon hashmap
+    string lex_line;
+    string word;
+    string sentiment;
+    vector<string> fields;
+    while (getline(infile, lex_line)) {
+        fields = split_tab(lex_line);
+        word = fields[0];
+        sentiment = fields[1];
+        //std:cout << word << " " << sentiment << endl; 
+        sentiment_lexicon[word] = sentiment;
+    
+    }
+    
+}
+
 void MonolingualModel::createBinaryTree() {
     vector<HuffmanNode*> heap;
     vector<HuffmanNode> parent_nodes;
@@ -127,6 +155,7 @@ HuffmanNode* MonolingualModel::getRandomHuffmanNode() {
 void MonolingualModel::initNet() {
     int v = static_cast<int>(vocabulary.size());
     int d = config->dimension;
+    int w = config->window_size;
 
     input_weights = mat(v, vec(d));
 
@@ -138,6 +167,41 @@ void MonolingualModel::initNet() {
 
     output_weights_hs = mat(v, vec(d));
     output_weights = mat(v, vec(d));
+	
+    if (config->learn_attn) {
+	std::cout<< "Initializing attention parameters in monolingual model" << std::endl;
+	attn_weights = mat(v,vec(2*w));
+	attn_bias = vec(2*w);
+
+    for (size_t row = 0; row < v; ++row) {
+      for (size_t col = 0; col< 2*w ; ++ col) {
+	 attn_weights[row][col] = 0;
+         //attn_weights[row][col] = (multivec::randf() - 0.5f) / 2*w;
+       }
+    }
+
+   for (size_t s =0; s < 2*w; ++ s) {
+     attn_bias[s]=0;
+     //attn_bias[s] = (multivec::randf() - 0.5f) / 2*w;
+  }
+ }
+ 
+    if (config->learn_sentiment) {
+        std::cout<< "Initializing sentiment output parameters in monolingual model" << std::endl;
+        int s = sizeof(sentiment_labels)/sizeof(sentiment_labels[0]);
+        std::cout<< "Number of sentiment labels: " << s << std::endl;
+        
+        sentiment_weights = mat(s, vec(d));
+        //in_sentiment_weights = mat(s, vec(d));
+        for (size_t row = 0; row < s; ++row) {
+           for (size_t col = 0; col < d; ++col) {
+                //(was initializing the output sentiment weights before)
+                sentiment_weights[row][col] = (multivec::randf() - 0.5f) / d;
+                //in_sentiment_weights[row][col] = (multivec::randf() - 0.5f) / d;
+            }
+        }
+    }
+
 }
 
 void MonolingualModel::initSentWeights() {
@@ -170,7 +234,7 @@ vector<HuffmanNode> MonolingualModel::getNodes(const string& sentence) const {
     return nodes;
 }
 
-/**
+/*
  * @brief Discard random nodes according to their frequency. The more frequent a word is, the more
  * likely it is to be discarded. Discarded nodes are replaced by UNK token.
  */
@@ -430,6 +494,10 @@ void MonolingualModel::train(const string& training_file, bool initialize) {
         // TODO: check that everything is initialized, and dimension is OK
         throw runtime_error("the model needs to be initialized before training");
     }
+    
+    if (config->learn_sentiment) {
+        readLexicon(config->sent_lexicon);
+    }
 
     // TODO: also serialize training state
     words_processed = 0;
@@ -591,10 +659,20 @@ int MonolingualModel::trainSentence(const string& sent, int sent_id) {
 }
 
 void MonolingualModel::trainWord(const vector<HuffmanNode>& nodes, int word_pos, int sent_id) {
+
     if (config->skip_gram) {
         trainWordSkipGram(nodes, word_pos, sent_id);
     } else {
-        trainWordCBOW(nodes, word_pos, sent_id);
+	if (config->learn_attn) {
+                //std::cout<< "Training word with CBOW Attn" << std::endl;
+                return trainWordCBOWAttn(nodes,word_pos,sent_id); 
+        } else {
+            
+            if (config->learn_sentiment) {
+                return trainWordCBOWSentiment(nodes,word_pos,sent_id,config->gamma);
+            } 
+        else return trainWordCBOW(nodes, word_pos, sent_id);
+	}
     }
 }
 
@@ -604,6 +682,7 @@ void MonolingualModel::trainWordCBOW(const vector<HuffmanNode>& nodes, int word_
     HuffmanNode cur_node = nodes[word_pos];
 
     int this_window_size = 1 + multivec::rand() % config->window_size; // reduced window
+    //int this_window_size = config->window_size;
     int count = 0;
 
     for (int pos = word_pos - this_window_size; pos <= word_pos + this_window_size; ++pos) {
@@ -639,6 +718,151 @@ void MonolingualModel::trainWordCBOW(const vector<HuffmanNode>& nodes, int word_
     }
 }
 
+void MonolingualModel::trainWordCBOWSentiment(const vector<HuffmanNode>& nodes, int word_pos, int sent_id, float gamma) {
+    
+    int dimension = config->dimension;
+    vec hidden(dimension, 0);
+    HuffmanNode cur_node = nodes[word_pos];
+    string word;
+    int sentiment_index = 3;
+    int in_sentiment_index = 3;
+    
+    if (gamma != 0.0) {
+    word = cur_node.word;
+    sentiment_index = sentimentIndex(word, sentiment_lexicon); 
+    // for foreign language words, we won't find them so index will be 3 (e.g in merged training)
+    }
+    
+    int this_window_size = 1 + multivec::rand() % config->window_size;
+    //int this_window_size = config->window_size;
+    int count = 0;
+
+    float numerator = 0;	
+
+    for (int pos = word_pos - this_window_size; pos <= word_pos + this_window_size; ++pos) {
+        if (pos < 0 || pos >= nodes.size() || pos == word_pos) continue;
+        	hidden += input_weights[nodes[pos].index];
+        	
+        	// if updating input sentiment weights also
+        	/*in_sentiment_index = sentimentIndex(nodes[pos].word, sentiment_lexicon);
+        	if (in_sentiment_index <=2 ){
+            hidden += in_sentiment_weights[in_sentiment_index];
+        	}*/
+        	
+        ++count;
+    }
+
+    if (count == 0) return;
+    hidden /= count;
+
+    vec error(dimension, 0); // compute error & update output weights
+    vec sentiment_error(dimension, 0);
+    
+    if (config->negative > 0) {
+        error += negSamplingUpdate(cur_node, hidden, alpha);
+        
+       // if ((has_lexicon || gamma != 0.0) && sentiment_index <=2) 
+       // for very large corpora, not enough words will hit the lexicon, so sentiment weights may not be updated properly
+       // maybe it's best if the sentiment embeddings are learned on a small corpus
+       if (gamma != 0.0 && sentiment_index <= 2) {
+            //sentiment_error += negSamplingUpdateSentimentSoftmax(cur_node, sentiment_index, hidden, &sentiment_weights, alpha, gamma);
+            sentiment_error += negSamplingUpdateSentiment(cur_node, sentiment_index, hidden, &sentiment_weights, alpha, gamma);
+        } 
+    }
+    
+     // Update input weights
+    for (int pos = word_pos - this_window_size; pos <= word_pos + this_window_size; ++pos) {
+        if (pos < 0 || pos >= nodes.size() || pos == word_pos) continue;
+            input_weights[nodes[pos].index] += error;
+            
+        // if updating input sentiment weights also
+       /* in_sentiment_index = sentimentIndex(nodes[pos].word, sentiment_lexicon);
+        if (in_sentiment_index <= 2) {
+            in_sentiment_weights[in_sentiment_index] += error;
+        } */
+        
+        if (gamma != 0.0  && sentiment_index <= 2) {
+            input_weights[nodes[pos].index] += sentiment_error;
+            
+            // if updating input sentiment weights also
+            /*if (in_sentiment_index <= 2) {
+                in_sentiment_weights[in_sentiment_index] += sentiment_error;
+            } */  
+            
+        }
+    } 
+      
+}
+
+void MonolingualModel::trainWordCBOWAttn(const vector<HuffmanNode>& nodes, int word_pos, int sent_id) {
+    int dimension = config->dimension;
+    vec hidden(dimension, 0);
+    HuffmanNode cur_node = nodes[word_pos];
+
+    int this_window_size = 1 + multivec::rand() % config->window_size; // reduced window
+    int max_window_size = config->window_size;
+    int count = 0;
+    float denominator = 0;
+    vec a(2*max_window_size);
+    for (int c =0;c<2*max_window_size;c++) {
+        a[c]=0;
+    }
+    int i=0;
+    for (int pos = word_pos - max_window_size; pos <= word_pos + max_window_size; ++pos) {
+        if (pos < 0 || pos >= nodes.size() || pos == word_pos || abs(word_pos-pos) > this_window_size) {
+         if (pos!=word_pos) { i+=1;}   
+	 continue;
+        }
+        //hidden += input_weights[nodes[pos].index];
+        ++count;
+	denominator += exp(attn_weights[nodes[pos].index][i] + attn_bias[i]);
+    }
+
+    int j=0;
+    for (int pos = word_pos - max_window_size; pos <= word_pos + max_window_size; ++pos) {
+
+        if (pos < 0 || pos >= nodes.size() || pos == word_pos || abs(word_pos-pos) > this_window_size) {
+                if (pos!=word_pos) { j+=1; }
+                continue;
+                }
+        a[j] = exp(attn_weights[nodes[pos].index][j] + attn_bias[j]) / denominator;
+        hidden += a[j]*input_weights[nodes[pos].index];
+        j+=1;
+     }
+
+    if (config->sent_vector) {
+        hidden += sent_weights[sent_id];
+        ++count;
+    }
+
+    if (count == 0) return;
+    //hidden /= count;
+
+    vec error(dimension, 0);
+    /*if (config->hierarchical_softmax) {
+        error += hierarchicalUpdateAttn(cur_node, hidden, alpha);
+    }*/
+    //MonolingualModel trg_model = *this;
+    if (config->negative > 0) {
+        error += negSamplingUpdateAttn(cur_node,nodes,*this,word_pos, this_window_size, hidden, alpha,a, &attn_weights, &attn_bias);
+    }
+
+    // update input weights
+    int p = 0;
+    for (int pos = word_pos - max_window_size; pos <= word_pos + max_window_size; ++pos) {
+        if (pos < 0 || pos >= nodes.size() || pos == word_pos || abs(word_pos-pos) > this_window_size) {
+	    if (pos!=word_pos) { p+=1; }	
+            continue;
+         }
+        input_weights[nodes[pos].index] += error;
+	p+=1;
+    }
+
+    if (config->sent_vector) {
+        sent_weights[sent_id] += error;
+    }
+}
+
 void MonolingualModel::trainWordSkipGram(const vector<HuffmanNode>& nodes, int word_pos, int sent_id) {
     int dimension = config->dimension;
     HuffmanNode input_word = nodes[word_pos]; // use this word to predict surrounding words
@@ -663,7 +887,319 @@ void MonolingualModel::trainWordSkipGram(const vector<HuffmanNode>& nodes, int w
     }
 }
 
+
 vec MonolingualModel::negSamplingUpdate(const HuffmanNode& node, const vec& hidden, float alpha, bool update) {
+    int dimension = config->dimension;
+    vec temp(dimension, 0);
+
+    for (int d = 0; d < config->negative + 1; ++d) {
+        int label;
+        const HuffmanNode* target;
+
+        if (d == 0) { // 1 positive example
+            target = &node;
+            label = 1;
+        } else { // n negative examples
+            target = getRandomHuffmanNode();
+            if (*target == node) continue;
+            label = 0;
+        }
+
+        float x = hidden.dot(output_weights[target->index]);
+
+        float pred;
+        if (x >= MAX_EXP) {
+            pred = 1;
+        } else if (x <= -MAX_EXP) {
+            pred = 0;
+        } else {
+            pred = sigmoid(x);
+        }
+        float error = alpha * (label - pred);
+
+        // update  for input
+        temp += error * output_weights[target->index];
+
+        // gradient for output
+        if (update)
+            output_weights[target->index] += error * hidden;
+            // also update attn_model[target[pos]] += error * attn_hidden   
+            // attn_hidden passed as parameter (the value we used for K[target[pos]], or the actual attention weight ai?)
+    }
+    // temp updates the input weights 
+    return temp;
+}
+
+vec MonolingualModel::negSamplingUpdateSentiment(const HuffmanNode& node, int sentiment_index, const vec& hidden, 
+    mat* sentiment_weights, float alpha, float gamma, bool update) {
+    
+    // This method will update the output sentiment weights
+    // and also return the error by which to update the input weights
+    
+    // TODO these changes can be made depending on results:
+    // 1) Assign sentiment indices to all huffman nodes when initializing vocab
+    // 2) Have the neg sampling update for sentiment and words on the same samples (I think not)
+    // 3) MAYBE THIS Use softmax for sentiment instead of sigmoid since it's just 3 labels (let's see how well it does)
+    // 4) MAYBE THIS Right now, this only works if we assume that gamma is 0 for target language models. Otherwise,
+    // we need to get the sentiment for the negative target samples as well.
+    // 5) Negative sample words of all possible sentiments rather than only for different sentiment (I think not)
+    
+    
+    int dimension = config->dimension;
+    vec temp(dimension, 0);
+    int index_sample;
+    int neg_samples = config->negative;
+    //int neg_samples = 10;
+
+    for (int d = 0; d < neg_samples + 1; ++d) {
+        int label;
+        int label_s;
+        const HuffmanNode* target;
+
+        if (d == 0) { // 1 positive example
+            target = &node;
+            label = 1;
+            index_sample = sentiment_index;
+        } else { // n negative examples
+            target = getRandomHuffmanNode();
+            // assumes for now that this function only gets called for source language words
+            // otherwise, we have to pre-store the alignments of all sentences
+            // better would be to sample sentiment in the same proportion that it appears for the source words 
+            index_sample = sentimentIndex(target->word, sentiment_lexicon);
+            if (*target == node) continue;
+            
+            // Don't sample it if it has the same sentiment or if it has none sentiment
+            if (index_sample == sentiment_index || index_sample == 3) continue;
+            label = 0;
+            // TODO assign sentiment index in the beginning to all nodes and call it with Huffman?
+            // do it if the approach works, for now just call sentiment index
+        }
+
+        float x = hidden.dot((*sentiment_weights)[index_sample]);
+        float pred;
+        if (x >= MAX_EXP) {
+            pred = 1;
+        } else if (x <= -MAX_EXP) {
+            pred = 0;
+        } else {
+            pred = sigmoid(x);
+        }
+        
+        // the sentiment index should be correct for the negative samples. Do they have to be the same negative samples as
+        // in the sentiment training? (in the same negative sampling function?)
+        // I think they don't have to be, it might even be better if sentiment information is learnt 'independently' 
+        // so keep it separate for now
+        float error = alpha * gamma * (label - pred);
+
+        // update  for input
+        temp += error * (*sentiment_weights)[index_sample];
+
+        // gradient for output
+        if (update)
+            (*sentiment_weights)[index_sample] += error * hidden;
+            //output_weights[target->index] += error * hidden;
+    }
+    // temp updates the input weights 
+    return temp;
+}
+
+vec MonolingualModel::negSamplingUpdateSentimentSoftmax(const HuffmanNode& node, int sentiment_index, const vec& hidden, 
+    mat* sentiment_weights, float alpha, float gamma, bool update) {
+    
+    // This method will update the output sentiment weights
+    // and also return the error by which to update the input weights
+    // Different from the other negSamplingUpdateSentiment, it will use softmax objective to
+    // compute the error and update the weights. Currently, everything else is the same.
+    
+    // TODO these changes can be made depending on results:
+    // 1) Assign sentiment indices to all huffman nodes when initializing vocab
+    // 2) Have the neg sampling update for sentiment and words on the same samples (I think not)
+    // 3) MAYBE THIS Use softmax for sentiment instead of sigmoid since it's just 3 labels (let's see how well it does)
+    // 4) MAYBE THIS Right now, this only works if we assume that gamma is 0 for target language models. Otherwise,
+    // we need to get the sentiment for the negative target samples as well.
+    // 5) Negative sample words of all possible sentiments rather than only for different sentiment (I think not)
+    // 6) Should we randomly select a sentiment label instead of a Huffman node? 
+            // or loop and apply neg sampling it to all sentiment labels? (yes, try this next)
+    // 7) Try to align and do it with all 4 models so the weights are stronger, or put lambda * 2, or more samples for the 
+        // less frequent classes
+    
+    
+    int dimension = config->dimension;
+    vec temp(dimension, 0);
+    int index_sample;
+    int N = (*sentiment_weights).size();
+    
+    for (int d = 0; d < N; ++d) {
+        int label;
+        //const HuffmanNode* target;
+
+        if (d == sentiment_index) { // 1 positive example
+            //target = &node;
+            label = 1;
+            //index_sample = sentiment_index;
+        } else { // n negative examples. For sentiment, we could just use all negative samples
+            //target = getRandomHuffmanNode();
+            //target = &node;
+            // assumes for now that this function only gets called for source language words
+            //index_sample = sentimentIndex(target->word, sentiment_lexicon);
+            //if (*target == node) continue;
+            
+            // Don't negative sample it if it has the same sentiment or if it has none sentiment
+            //if (index_sample == sentiment_index || index_sample == 3) continue;
+            label = 0;
+
+        }
+        float x = hidden.dot((*sentiment_weights)[d]);
+        float pred;
+        if (x >= MAX_EXP) {
+            pred = 1;
+        } else if (x <= -MAX_EXP) {
+            pred = 0;
+        } else {
+            pred = sigmoid(x);
+        }
+
+        //float pred = softmax(hidden, sentiment_weights, d , N);
+        //float pred = softmax(hidden, sentiment_weights, index_sample, N);
+        //cout << "softmax pred: " << pred << endl;
+        
+        /*float error_true = label - pred;
+        float error_negative = -pred; // actually this is already being done because label is 0 for negative samples
+        float error;*/
+        float error = alpha * gamma * (label - pred);
+        /*if (d==0) {
+            // updating for true samples
+            //error = label - pred;
+            error = error_true;
+        } else {
+            // updating for negative samples 
+            // TODO see if I computed derivatives right
+            error = error_negative;
+            //error = -pred; 
+        }*/
+        // error = error * alpha * gamma;
+        // update  for input
+        temp += error * (*sentiment_weights)[d];
+        
+        // Update sentiment weights
+        if (update) {
+            (*sentiment_weights)[d] += error * hidden;
+           //  float update_error;
+            /*for (int j=0; j < N; j++) {
+                if (j==index_sample) {
+                    update_error = error_true;
+                    //error = label - pred;
+                } else{
+                    update_error = error_negative;
+                    //error = -pred; 
+                }
+                (*sentiment_weights)[j] += update_error * hidden;
+            }*/
+        }
+        
+        // gradient for output
+        //if (update)
+            //(*sentiment_weights)[index_sample] += error * hidden;      
+    }
+    // temp updates the input weights 
+    return temp;
+}
+
+vec MonolingualModel::negSamplingUpdateAttn(const HuffmanNode& node, const vector<HuffmanNode>& trg_nodes, const MonolingualModel& trg_model, int trg_pos, int this_window_size,
+const vec& hidden, float alpha, const vec& a, mat* k, vec* s, bool update) {
+    int dimension = config->dimension;
+    vec temp(dimension, 0);
+    
+    for (int d = 0; d < config->negative + 1; ++d) {
+        int label;
+        const HuffmanNode* target;
+
+        if (d == 0) { // 1 positive example
+            target = &node;
+            label = 1;
+        } else { // n negative examples
+            target = getRandomHuffmanNode();
+            if (*target == node) continue;
+            label = 0;
+        }
+
+        float x = hidden.dot(output_weights[target->index]);
+
+        float pred;
+        if (x >= MAX_EXP) {
+            pred = 1;
+        } else if (x <= -MAX_EXP) {
+            pred = 0;
+        } else {
+            pred = sigmoid(x);
+        }
+        float error = alpha * (label - pred);
+        temp += error * output_weights[target->index];
+	
+	// update for input
+	int size_a = static_cast<int>(a.size());
+	int max_window = size_a/2;
+	float const_term = label - pred;
+	int i=0;
+	int j=0;
+        for (int pos= trg_pos - max_window; pos <= trg_pos + max_window ; ++pos) {
+		//int error_attn = 0;
+		if (pos < 0 || pos >= trg_nodes.size() || pos == trg_pos || abs(trg_pos - pos) > this_window_size) {
+		 if (pos != trg_pos) { i+=1;}
+		 	continue;
+		}
+		float y = trg_model.input_weights[trg_nodes[pos].index].dot(output_weights[target->index]);
+		//Update attention matrix for each position/context word
+		j=0;
+		for (int context_pos= trg_pos - max_window; context_pos <= trg_pos + max_window; ++context_pos) {
+		
+		if (context_pos < 0 || context_pos >= trg_nodes.size() || context_pos == trg_pos ||  abs(trg_pos - context_pos) > this_window_size) {
+                 if (context_pos != trg_pos) j+=1;
+                        continue;
+                }
+                int error_attn = 0;
+                if (i==j){ // for this pos
+		    if (pos != context_pos) {
+			std::cout << "context pos should equal pos!" << std::endl;
+			return 0;
+		    } 
+                    error_attn = a[i]*(1-a[j]);   
+		    error_attn = error_attn * y;                     
+                } else { // for context_pos
+                    error_attn = -a[i]*a[j];
+		    error_attn = error_attn * trg_model.input_weights[trg_nodes[context_pos].index].dot(output_weights[target->index]);
+                   // FOR 2 LOOP: this will be error_attn = error_attn * y
+		 }  
+                error_attn = error_attn * const_term;
+                error_attn = error_attn * alpha;
+                (*s)[j] += error_attn;
+                (*k)[trg_nodes[context_pos].index][j] += error_attn; 
+                j+=1;
+		 }
+         	/*for (int j=0; j<size_a; j++) {
+		int error_attn = 0;
+		if (i==j){
+      		    error_attn += a[i]*(1-a[j]);			
+		} else {
+                    error_attn += -a[i]*a[j];
+                }
+		error_attn = error_attn * y;  
+		error_attn = error_attn * const_term;
+                error_attn = error_attn * alpha;
+                (*s)[j] += error_attn;
+                (*k)[trg_nodes[pos].index][j] += error_attn; 
+		}*/
+	i+=1;	        
+        }	
+        if (update)
+            output_weights[target->index] += error * hidden;
+    }
+    // temp is alpha * Co(w) * (label-pred)
+    return temp;
+}
+
+
+/*vec MonolingualModel::negSamplingContextUpdate(const HuffmanNode& node,const HuffmanNode& contextList, const vec& hidden, float alpha, bool update) {
     int dimension = config->dimension;
     vec temp(dimension, 0);
 
@@ -699,7 +1235,17 @@ vec MonolingualModel::negSamplingUpdate(const HuffmanNode& node, const vec& hidd
     }
 
     return temp;
+}*/
+
+/*
+
+vec MonolingualModel::hierarchicalContextUpdate(const HuffmanNode& node, const HuffmanNode& contextList, const vec& hidden,
+        float alpha, bool update) {
+
+
 }
+
+*/
 
 vec MonolingualModel::hierarchicalUpdate(const HuffmanNode& node, const vec& hidden,
         float alpha, bool update) {
@@ -708,13 +1254,13 @@ vec MonolingualModel::hierarchicalUpdate(const HuffmanNode& node, const vec& hid
 
     for (int j = 0; j < node.code.size(); ++j) {
         int parent_index = node.parents[j];
-        float x = hidden.dot(output_weights_hs[parent_index]);
+	float x = hidden.dot(output_weights_hs[parent_index]);
 
         if (x <= -MAX_EXP || x >= MAX_EXP) {
             continue;
         }
 
-        float pred = sigmoid(x);
+	float pred = sigmoid(x);
         float error = -alpha * (pred - node.code[j]);
 
         temp += error * output_weights_hs[parent_index];
@@ -735,4 +1281,114 @@ vector<pair<string, int>> MonolingualModel::getWords() const {
 
     return res;
 }
+
+vec MonolingualModel::hierarchicalUpdateAttn(const HuffmanNode& node, const vector<HuffmanNode>& trg_nodes, const MonolingualModel& trg_model, int trg_pos, const vec& hidden, float alpha, const vec& a, mat* k, vec* s, bool update) {
+    int dimension = config->dimension;
+    vec temp(dimension, 0);
+
+    for (int j = 0; j < node.code.size(); ++j) {
+        int parent_index = node.parents[j]; 
+	float x = hidden.dot(output_weights_hs[parent_index]);
+
+        if (x <= -MAX_EXP || x >= MAX_EXP) {
+            continue;
+        }
+        float pred = sigmoid(x);
+        float error = -alpha * (pred - node.code[j]);
+
+        temp += error * output_weights_hs[parent_index];
+
+	int size_a = static_cast<int>(a.size());
+	int this_window = size_a/2;
+        //float const_term = 1/size_a * output_weights_hs[parent_index].dot(input_weights[parent_index]);
+        float const_term = - 1/size_a * (pred - node.code[j]);
+	/*for (int i=0; i<size_a; i++) {
+                int error_attn = 0;
+                for (int w=0; w<size_a; w++) {
+                if (i==w){
+                    error_attn += a[i]*(1-a[w]);
+                } else {
+                    error_attn += -a[i]*a[w];
+                }
+                error_attn = error_attn * const_term;
+                error_attn = error_attn * alpha;
+                s[i] += error_attn; 
+                k[parent_index][i] += error_attn;
+                }
+	}*/
+	int i=0;
+        for (int pos= trg_pos - this_window; pos <= trg_pos + this_window ; ++pos) {             
+                if (pos < 0 || pos >= trg_nodes.size() || pos == trg_pos) continue;
+                // Update attention matrix for each position
+		// Check, might be wrong
+		for (int p =0; p< trg_nodes[pos].code.size(); ++p) {
+		int context_index = trg_nodes[pos].parents[p]; 
+		float y = trg_model.input_weights[context_index].dot(output_weights_hs[parent_index]);
+		for (int z=0; z<size_a; z++) {
+                int error_attn = 0;
+                if (i==z){ 
+                    error_attn += a[i]*(1-a[z]);    
+                } else {
+                    error_attn += -a[i]*a[z];
+                }
+		error_attn = error_attn * y;
+                error_attn = error_attn * const_term;
+                error_attn = error_attn * alpha;
+                (*s)[z] += error_attn;
+                // k[context] should be updated not k[center]            
+                (*k)[trg_nodes[pos].index][z] += error_attn;
+                }
+	   }
+        i+=1;
+        }
+
+        if (update)
+            output_weights_hs[parent_index] += error * hidden;
+    }
+
+    return temp;
+}
+
+void MonolingualModel::saveSentimentVectors(const string &filename, int policy) const {
+    if (config->verbose)
+        std::cout << "Saving sentiment vectors in text format to " << filename << std::endl;
+    
+    std::cout << "Policy: " << policy << std::endl;
+
+    ofstream outfile(filename, ios::binary | ios::out);
+
+    try {
+        check_is_open(outfile, filename);
+    } catch (...) {
+        throw;
+    }
+
+    int index = 0;
+    int d = config->dimension;
+    int s = sizeof(sentiment_labels)/sizeof(sentiment_labels[0]);
+    
+    outfile << s << " " << d << endl;
+    
+    for (auto it = sentiment_weights.begin(); it != sentiment_weights.end(); ++it) {
+        std::cout << "index: " << index << " ";
+        string label = sentimentLabel(index);
+        std::cout << "label: " << label << endl;
+        outfile << label << " ";
+        vec embedding = *it; // by default, sentiment output weights
+       /* if (policy == 0){
+            // only input sentiment weights
+            embedding = in_sentiment_weights[index];
+        }
+        else if (policy == 2) {
+            // sum
+            embedding += in_sentiment_weights[index];
+        }*/
+        for (int c = 0; c < config->dimension; ++c) {
+            outfile << embedding[c] << " ";
+        }
+        outfile << endl;
+        index +=1;
+    }
+}
+
 

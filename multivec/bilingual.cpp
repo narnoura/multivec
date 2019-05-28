@@ -1,6 +1,56 @@
 #include "bilingual.hpp"
 #include "serialization.hpp"
 
+void BilingualModel::initAttention() {
+
+std::cout<< "Initializing attention parameters in bilingual model" << std::endl;
+int v_src = static_cast<int>(src_model.vocabulary.size());
+int v_trg = static_cast<int>(trg_model.vocabulary.size());
+int w = config->window_size;
+
+src_trg_attn = mat(v_src,vec(2*w));
+trg_src_attn = mat(v_trg,vec(2*w));
+src_trg_bias = vec(2*w);
+trg_src_bias = vec(2*w);
+
+for (size_t row = 0; row < v_src; ++row) {
+      for (size_t col = 0; col< 2*w ; ++ col) {
+        src_trg_attn[row][col]=0;
+	 }
+}
+for (size_t row = 0; row < v_trg; ++row) {
+      for (size_t col = 0; col< 2*w ; ++ col) {
+	trg_src_attn[row][col]=0;
+       }
+}
+
+for (size_t s =0; s < 2*w; ++ s) {
+   src_trg_bias[s]=0;
+   trg_src_bias[s]=0;
+}
+
+}
+
+void BilingualModel::initSentiment() {
+
+// Sentiment indices will correspond to the positions defined in sentiment_labels
+// in utils.hpp
+std::cout<< "Initializing sentiment output parameters in bilingual model" << std::endl;
+int d = config->dimension;
+int s = sizeof(sentiment_labels)/sizeof(sentiment_labels[0]);
+std::cout<< "Number of sentiment labels: " << s << std::endl;
+sentiment_weights = mat(s, vec(d));
+//in_sentiment_weights = mat(s, vec(d));
+for (size_t row = 0; row < s; ++row) {
+   for (size_t col = 0; col < d; ++col) {
+         //(was initializing the output sentiment weights before)
+        sentiment_weights[row][col] = (multivec::randf() - 0.5f) / d;
+        //in_sentiment_weights[row][col] = (multivec::randf() - 0.5f) / d;
+    }
+ }
+
+}
+
 void BilingualModel::train(const string& src_file, const string& trg_file, bool initialize) {
     std::cout << "Training files: " << src_file << ", " << trg_file << std::endl;
 
@@ -12,6 +62,13 @@ void BilingualModel::train(const string& src_file, const string& trg_file, bool 
         trg_model.readVocab(trg_file);
         src_model.initNet();
         trg_model.initNet();
+	if (config->learn_attn) {
+	    initAttention();
+	}
+	if (config->learn_sentiment) {
+        	src_model.readLexicon(config->sent_lexicon);
+        	initSentiment();
+	}
     } else {
         // TODO: check that initialization is fine
     }
@@ -154,41 +211,74 @@ int BilingualModel::trainSentence(const string& src_sent, const string& trg_sent
     trg_nodes.erase(
         std::remove(trg_nodes.begin(), trg_nodes.end(), HuffmanNode::UNK),
         trg_nodes.end());
+        
+    bool has_lexicon = false;
 
     // Monolingual training
+    // TODO add sentiment attention weights to this function and call with pointer
+    // may not need to have the extra parameter
     for (int src_pos = 0; src_pos < src_nodes.size(); ++src_pos) {
-        trainWord(src_model, src_model, src_nodes, src_nodes, src_pos, src_pos, alpha);
+	// trainWord(src_model, src_model, src_nodes, src_nodes, src_pos, src_pos, alpha,true,false);
+	trainWord(src_model, src_model, src_nodes, src_nodes, src_pos, src_pos, alpha, config->gamma, &src_model.attn_weights, &src_model.attn_bias);
     }
+    //std::cout<< "Done with monolingual source" << std::endl;
 
     for (int trg_pos = 0; trg_pos < trg_nodes.size(); ++trg_pos) {
-        trainWord(trg_model, trg_model, trg_nodes, trg_nodes, trg_pos, trg_pos, alpha);
+        //trainWord(trg_model, trg_model, trg_nodes, trg_nodes, trg_pos, trg_pos, alpha,true,false);
+	//std::cout << "k[trg_nodes[pos].index][0]: " << trg_model.attn_weights[trg_nodes[trg_pos].index][0] << std::endl;
+        trainWord(trg_model, trg_model, trg_nodes, trg_nodes, trg_pos, trg_pos, alpha, 0.0, &trg_model.attn_weights, &trg_model.attn_bias, has_lexicon);
     }
+
+    //std::cout<< "Done with monolingual target" << std::endl;
 
     if (config->beta == 0)
         return words;
 
     // Bilingual training
+    // For sentiment training, we can set gamma to 0 for models that predict the target word (since we don't know its sentiment)
+    // If we set it to value of gamma, we give it the same sentiment as the source word it aligns to
+    
     for (int src_pos = 0; src_pos < src_nodes.size(); ++src_pos) {
         // 1-1 mapping between src_nodes and trg_nodes
         int trg_pos = alignment[src_pos];
 
         if (trg_pos != -1) { // target word isn't OOV
-            trainWord(src_model, trg_model, src_nodes, trg_nodes, src_pos, trg_pos, alpha * config->beta);
-            trainWord(trg_model, src_model, trg_nodes, src_nodes, trg_pos, src_pos, alpha * config->beta);
+            //trainWord(src_model, trg_model, src_nodes, trg_nodes, src_pos, trg_pos, alpha * config->beta,false,true);
+        	    trainWord(src_model, trg_model, src_nodes, trg_nodes, src_pos, trg_pos, alpha * config->beta, config->gamma, &trg_src_attn, &trg_src_bias);
+        	    // std::cout<< "Done with training src_target word (predicts src word) " << std::endl;
+             trainWord(trg_model, src_model, trg_nodes, src_nodes, trg_pos, src_pos, alpha * config->beta, 0.0, &src_trg_attn, &src_trg_bias, has_lexicon);
+        	   // trainWord(trg_model, src_model, trg_nodes, src_nodes, trg_pos, src_pos, alpha * config->beta, config->gamma, &src_trg_attn, &src_trg_bias, has_lexicon);
+        	    //std::cout<< "Done with training target_src word (predicts trg_word)" << std::endl;
         }
     }
-
+    //std::cout<< "Done with bilingual " << std::endl;
+    //std::cout << "Done with sentence" << std::endl;
     return words; // returns the number of words processed (for progress estimation)
 }
 
 void BilingualModel::trainWord(MonolingualModel& src_model, MonolingualModel& trg_model,
                                const vector<HuffmanNode>& src_nodes, const vector<HuffmanNode>& trg_nodes,
-                               int src_pos, int trg_pos, float alpha) {
+                               int src_pos, int trg_pos, float alpha, float gamma, mat* k, vec* s, bool has_lexicon) {
 
     if (config->skip_gram) {
         return trainWordSkipGram(src_model, trg_model, src_nodes, trg_nodes, src_pos, trg_pos, alpha);
     } else {
-        return trainWordCBOW(src_model, trg_model, src_nodes, trg_nodes, src_pos, trg_pos, alpha);
+
+	if (config->learn_attn) {
+		//std::cout<< "Training word with CBOW Attn" << std::endl;
+		return trainWordCBOWAttn(src_model, trg_model, src_nodes, trg_nodes, src_pos, trg_pos, alpha, k, s);
+	} 
+	else {
+        	
+        	if (config->learn_sentiment) {
+        	
+            	//std::cout << "Training word with sentiment" << std::endl;
+            	return trainWordCBOWSentiment(src_model, trg_model, src_nodes, trg_nodes, src_pos, trg_pos, alpha, gamma, has_lexicon);
+        	}
+		
+		else return trainWordCBOW(src_model, trg_model, src_nodes, trg_nodes, src_pos, trg_pos, alpha);
+		// TODO add the sentiment if statement and call here
+        	}
     }
 }
 
@@ -201,16 +291,20 @@ void BilingualModel::trainWordCBOW(MonolingualModel& src_model, MonolingualModel
 
     // 'src_pos' is the position in the source sentence of the current node to predict
     // 'trg_pos' is the position of the corresponding node in the target sentence
+
     int dimension = config->dimension;
     vec hidden(dimension, 0);
     HuffmanNode cur_node = src_nodes[src_pos];
 
     int this_window_size = 1 + multivec::rand() % config->window_size;
+    //int this_window_size = config->window_size;
     int count = 0;
+
+    float numerator = 0;	
 
     for (int pos = trg_pos - this_window_size; pos <= trg_pos + this_window_size; ++pos) {
         if (pos < 0 || pos >= trg_nodes.size() || pos == trg_pos) continue;
-        hidden += trg_model.input_weights[trg_nodes[pos].index];
+	hidden += trg_model.input_weights[trg_nodes[pos].index];
         ++count;
     }
 
@@ -229,6 +323,181 @@ void BilingualModel::trainWordCBOW(MonolingualModel& src_model, MonolingualModel
     for (int pos = trg_pos - this_window_size; pos <= trg_pos + this_window_size; ++pos) {
         if (pos < 0 || pos >= trg_nodes.size() || pos == trg_pos) continue;
         trg_model.input_weights[trg_nodes[pos].index] += error;
+    } 
+}
+
+void BilingualModel::trainWordCBOWSentiment(MonolingualModel& src_model, MonolingualModel& trg_model,
+                                   const vector<HuffmanNode>& src_nodes, const vector<HuffmanNode>& trg_nodes,
+                                   int src_pos, int trg_pos, float alpha, float gamma, bool has_lexicon = true) {
+    // Trains the model by predicting a source node from its aligned context in the target sentence.
+    // This function can be used in the reverse direction just by reversing the arguments. Likewise,
+    // for monolingual training, use the same values for source and target.
+    
+    // Learns sentiment vectors that predict the probability of the center node having prior sentiment polarity
+    // Only sentiment vectors for subjective labels (i.e positive, negative, neutral) will be sampled and updated
+
+    // 'src_pos' is the position in the source sentence of the current node to predict
+    // 'trg_pos' is the position of the corresponding node in the target sentence
+
+    int dimension = config->dimension;
+    vec hidden(dimension, 0);
+    HuffmanNode cur_node = src_nodes[src_pos];
+    string word;
+    int sentiment_index = 3;
+    int in_sentiment_index = 3;
+    
+    if (has_lexicon) {
+       word = cur_node.word;
+       sentiment_index = sentimentIndex(word, src_model.sentiment_lexicon);
+    } 
+    else if (gamma != 0.0) {
+    // Can do it even if gamma is 0
+       word = trg_nodes[trg_pos].word; // use the sentiment lexicon from the other language
+       sentiment_index = sentimentIndex(word, trg_model.sentiment_lexicon);
+    }
+
+    int this_window_size = 1 + multivec::rand() % config->window_size;
+    //int this_window_size = config->window_size;
+    int count = 0;
+
+    float numerator = 0;	
+
+    for (int pos = trg_pos - this_window_size; pos <= trg_pos + this_window_size; ++pos) {
+        if (pos < 0 || pos >= trg_nodes.size() || pos == trg_pos) continue;
+	hidden += trg_model.input_weights[trg_nodes[pos].index];
+	
+	// if updating input sentiment weights also
+	/*in_sentiment_index = sentimentIndex(trg_nodes[pos].word, src_model.sentiment_lexicon);
+	if (in_sentiment_index <=2 ){
+        hidden += in_sentiment_weights[in_sentiment_index];
+	}*/
+	
+        ++count;
+    }
+
+    if (count == 0) return;
+    hidden /= count;
+
+    vec error(dimension, 0); // compute error & update output weights
+    vec sentiment_error(dimension, 0);
+    /*if (config->hierarchical_softmax) {
+        error += src_model.hierarchicalUpdate(cur_node, hidden, alpha);
+    }*/
+    if (config->negative > 0) {
+        error += src_model.negSamplingUpdate(cur_node, hidden, alpha);
+        
+       // if ((has_lexicon || gamma != 0.0) && sentiment_index <=2) 
+       if (has_lexicon && sentiment_index <= 2) {
+            //sentiment_error += src_model.negSamplingUpdateSentimentSoftmax(cur_node, sentiment_index, hidden, &sentiment_weights, alpha, gamma);
+            sentiment_error += src_model.negSamplingUpdateSentiment(cur_node, sentiment_index, hidden, &sentiment_weights, alpha, gamma);
+        } else if (gamma != 0.0 && sentiment_index <=2 ) {
+            // sample the sentiment error using the source language
+            sentiment_error += trg_model.negSamplingUpdateSentiment(trg_nodes[trg_pos], sentiment_index, hidden, &sentiment_weights, alpha, gamma);
+        } 
+    }
+
+    // Update input weights
+    for (int pos = trg_pos - this_window_size; pos <= trg_pos + this_window_size; ++pos) {
+        if (pos < 0 || pos >= trg_nodes.size() || pos == trg_pos) continue;
+        trg_model.input_weights[trg_nodes[pos].index] += error;
+        
+        // if updating input sentiment weights also
+        /*in_sentiment_index = sentimentIndex(trg_nodes[pos].word, src_model.sentiment_lexicon);
+        if (in_sentiment_index <= 2) {
+            in_sentiment_weights[in_sentiment_index] += error;
+        } */
+        
+        if ((has_lexicon || gamma != 0.0) && sentiment_index <= 2) {
+            trg_model.input_weights[trg_nodes[pos].index] += sentiment_error;
+            
+            // if updating input sentiment weights also
+           /* if (in_sentiment_index <= 2) {
+                in_sentiment_weights[in_sentiment_index] += sentiment_error;
+            } */
+        }
+    } 
+}
+
+void BilingualModel::trainWordCBOWAttn(MonolingualModel& src_model, MonolingualModel& trg_model,
+                                   const vector<HuffmanNode>& src_nodes, const vector<HuffmanNode>& trg_nodes,
+                                   int src_pos, int trg_pos, float alpha, mat* k, vec* s) {
+    // Trains the model by predicting a source node from its aligned context in the target sentence.
+    // This function can be used in the reverse direction just by reversing the arguments. Likewise,
+    // for monolingual training, use the same values for source and target.
+
+    // 'src_pos' is the position in the source sentence of the current node to predict
+    // 'trg_pos' is the position of the corresponding node in the target sentence
+	
+    //  Uses attention weights to prioritize contexts from the window
+    
+    int dimension = config->dimension;
+    vec hidden(dimension, 0);
+    HuffmanNode cur_node = src_nodes[src_pos];
+
+    int this_window_size = 1 + multivec::rand() % config->window_size;
+    int max_window_size = config->window_size;
+    int count = 0;
+    float denominator = 0;
+    vec a(2*max_window_size);
+    for (int c =0;c<2*max_window_size;c++) {
+ 	a[c]=0;	
+    }
+     
+    int i = 0;
+    for (int pos = trg_pos - max_window_size; pos <= trg_pos + max_window_size; ++pos) {
+	
+	if (pos < 0 || pos >= trg_nodes.size() || pos == trg_pos 
+		|| abs(trg_pos - pos) > this_window_size) { 
+		if (pos!=trg_pos) {
+			i+=1;
+		}
+		continue;
+	}
+	++ count;
+	denominator += exp((*k)[trg_nodes[pos].index][i] + (*s)[i]);
+	/*if (i > 2*max_window_size - 1) {
+	std::cout << "i is bigger than context window!" << std::endl;
+	std::cout << "i: " << i << std::endl;
+	return;	
+	}*/
+       i+=1;
+     }
+
+    int j=0;
+    for (int pos = trg_pos - max_window_size; pos <= trg_pos + max_window_size; ++pos) {
+
+	if (pos < 0 || pos >= trg_nodes.size() || pos == trg_pos
+	     ||	abs(trg_pos - pos) > this_window_size) {
+		if (pos!=trg_pos) { j+=1; }
+		continue;
+	 	}
+	a[j] = exp((*k)[trg_nodes[pos].index][j] + (*s)[j]) / denominator;
+	hidden += a[j]*trg_model.input_weights[trg_nodes[pos].index];
+	j+=1;
+     }
+
+    if (count == 0) return;
+    //hidden /= count;
+
+   vec error(dimension, 0); // compute error & update output weights
+   /* if (config->hierarchical_softmax) {
+	 error += src_model.hierarchicalUpdateAttn(cur_node, trg_nodes, trg_model, trg_pos,hidden, alpha, a, k,s);
+  }*/
+
+   if (config->negative > 0) {
+        error += src_model.negSamplingUpdateAttn(cur_node, trg_nodes, trg_model,trg_pos, this_window_size, hidden, alpha, a, k,s);
+   }  
+
+    // Update input weights
+    int p = 0;
+    for (int pos = trg_pos - max_window_size; pos <= trg_pos + max_window_size; ++pos) {
+        if (pos < 0 || pos >= trg_nodes.size() || pos == trg_pos
+		|| abs(trg_pos - pos) > this_window_size) {
+		if (pos!=trg_pos) {p+=1;}
+		 continue;
+	}
+	trg_model.input_weights[trg_nodes[pos].index] += error;
+	p+=1;
     }
 }
 
@@ -242,7 +511,7 @@ void BilingualModel::trainWordSkipGram(MonolingualModel& src_model, MonolingualM
     for (int pos = trg_pos - this_window_size; pos <= trg_pos + this_window_size; ++pos) {
         if (pos < 0 || pos >= trg_nodes.size() || pos == trg_pos) continue;
         HuffmanNode output_word = trg_nodes[pos];
-
+        
         vec error(config->dimension, 0);
         if (config->hierarchical_softmax) {
             error += trg_model.hierarchicalUpdate(output_word, src_model.input_weights[input_word.index], alpha);
@@ -285,4 +554,48 @@ void BilingualModel::save(const string& filename) const {
     }
 
     ::save(outfile, *this);
+}
+
+void BilingualModel::saveSentimentVectors(const string &filename, int policy) const {
+    if (config->verbose)
+        std::cout << "Saving sentiment vectors in text format to " << filename << std::endl;
+
+    ofstream outfile(filename, ios::binary | ios::out);
+
+    try {
+        check_is_open(outfile, filename);
+    } catch (...) {
+        throw;
+    }
+
+    int index = 0;
+    int d = config->dimension;
+    int s = sizeof(sentiment_labels)/sizeof(sentiment_labels[0]);
+    
+    outfile << s << " " << d << endl;
+    
+    for (auto it = sentiment_weights.begin(); it != sentiment_weights.end(); ++it) {
+        /*  for (auto it = vocabulary.begin(); it != vocabulary.end(); ++it) {
+        outfile << it->second.word << " ";
+        vec embedding = wordVec(it->second.index, policy); } */
+        std::cout << "index: " << index << " ";
+        string label = sentimentLabel(index);
+        std::cout << "label: " << label << endl;
+        outfile << label << " ";
+        vec embedding = *it; // by default, sentiment output weights
+        /*if (policy == 0){
+            // only input sentiment weights
+            embedding = in_sentiment_weights[index];
+        }
+        else if (policy == 2) {
+            // sum
+            embedding += in_sentiment_weights[index];
+        }*/
+        for (int c = 0; c < config->dimension; ++c) {
+            outfile << embedding[c] << " ";
+            //std::cout << embedding[c] << " ";
+        }
+        outfile << endl;
+        index +=1;
+    }
 }

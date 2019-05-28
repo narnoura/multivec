@@ -14,6 +14,10 @@ private:
     mat output_weights; // output weights for negative sampling
     mat output_weights_hs; // output weights for hierarchical softmax
     mat sent_weights;
+    mat attn_weights; // here are the monolingual attention weights
+    vec attn_bias;
+    mat sentiment_weights; // output sentiment weights for monolingual training
+    mat in_sentiment_weights; // input sentiment weights for monolingual training
 
     long long vocab_word_count; // property of vocabulary (sum of all word counts)
 
@@ -26,6 +30,9 @@ private:
 
     unordered_map<string, HuffmanNode> vocabulary;
     vector<HuffmanNode*> unigram_table;
+    
+    // monolingual sentiment lexicon
+    unordered_map<string, string> sentiment_lexicon;
 
     void addWordToVocab(const string& word);
     void reduceVocab();
@@ -39,6 +46,7 @@ private:
     void subsample(vector<HuffmanNode>& node) const;
 
     void readVocab(const string& training_file);
+    void readLexicon(const string& lexicon_file);
     void initNet();
     void initSentWeights();
 
@@ -47,10 +55,16 @@ private:
     int trainSentence(const string& sent, int sent_id);
     void trainWord(const vector<HuffmanNode>& nodes, int word_pos, int sent_id);
     void trainWordCBOW(const vector<HuffmanNode>& nodes, int word_pos, int sent_id);
+    void trainWordCBOWAttn(const vector<HuffmanNode>& nodes, int word_pos, int sent_id);
+    void trainWordCBOWSentiment(const vector<HuffmanNode>& nodes, int word_pos, int sent_id, float gamma);
     void trainWordSkipGram(const vector<HuffmanNode>& nodes, int word_pos, int sent_id);
 
     vec hierarchicalUpdate(const HuffmanNode& node, const vec& hidden, float alpha, bool update = true);
+    vec hierarchicalUpdateAttn(const HuffmanNode& node, const vector<HuffmanNode>& context_nodes, const MonolingualModel& trg_model,int trg_pos, const vec& hidden, float alpha, const vec& a, mat* k, vec* s, bool update = true);
     vec negSamplingUpdate(const HuffmanNode& node, const vec& hidden, float alpha, bool update = true);
+    vec negSamplingUpdateSentiment(const HuffmanNode& node, int sentiment_index, const vec& hidden, mat* sentiment_weights, float alpha, float gamma, bool update = true);
+    vec negSamplingUpdateSentimentSoftmax(const HuffmanNode& node, int sentiment_index, const vec& hidden, mat* sentiment_weights, float alpha, float gamma, bool update = true);
+    vec negSamplingUpdateAttn(const HuffmanNode& node, const vector<HuffmanNode>& context_nodes, const MonolingualModel& trg_model, int trg_pos, int this_window_size, const vec& hidden, float alpha, const vec& a, mat* k, vec* s, bool update = true);	
 
     vector<long long> chunkify(const string& filename, int n_chunks);
     vec wordVec(int index, int policy) const;
@@ -69,6 +83,7 @@ public:
     void saveSentVectors(const string &filename) const;
     void load(const string& filename); // loads the entire model
     void save(const string& filename) const; // saves the entire model
+    void saveSentimentVectors(const string &filename, int policy = 3) const;
 
     void normalizeWeights(); // normalize all weights between 0 and 1
 

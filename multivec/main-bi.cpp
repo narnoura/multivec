@@ -29,6 +29,14 @@ static vector<option_plus> options_plus = {
     {"save",          required_argument, 0, 'p', "save model"},
     {"save-src",      required_argument, 0, 'q', "save source model"},
     {"save-trg",      required_argument, 0, 'r', "save target model"},
+    {"train-sentiment", required_argument,0,'y', "tsv lexicon for learning sentiment"},
+    {"save-sentiment",  required_argument,0,'z', "where to save save sentiment weights"},
+    {"gamma", required_argument,0,'t', "learning rate for sentiment"},
+    {"sent-vector",   no_argument,0,'s',"learn bilingual sentence vectors"}, 
+    {"attn",          no_argument,0,'w',"learn attention weights"},
+    {"sentiment",     no_argument,0,'x',"learn sentiment vectors"},
+    {"sentiment-policy", required_argument, 0, '$', "policy for saving sentiment vectors"},
+  
     {0, 0, 0, 0, 0}
 };
 
@@ -78,6 +86,9 @@ int main(int argc, char **argv) {
     string save_file;
     string save_src_file;
     string save_trg_file;
+    string train_sent_file;
+    string save_sent_file;
+    int sentiment_policy = 3;
 
     optind = 0;  // necessary to parse arguments twice
     while (1) {
@@ -106,6 +117,15 @@ int main(int argc, char **argv) {
             case 'p': save_file = string(optarg);           break;
             case 'q': save_src_file = string(optarg);       break;
             case 'r': save_trg_file = string(optarg);       break;
+	    case 's': config.sent_vector = true;	    break;
+//	    case 't': config.comparable = true;		    break;
+	    case 'w': config.learn_attn = true;             break;
+	    case 'x': config.learn_sentiment = true; break;
+	    case 'y': train_sent_file = string(optarg);
+            	     config.sent_lexicon = train_sent_file; break;
+	    case 'z': save_sent_file = string(optarg); break;
+	    case 't': config.gamma = atof(optarg); break;
+	    case '$': sentiment_policy = atoi(optarg); break;
             default:                                        abort();
         }
     }
@@ -114,12 +134,22 @@ int main(int argc, char **argv) {
         print_usage();
         return 0;
     }
+    if (config.learn_sentiment && (train_sent_file.empty() || save_sent_file.empty())) {
+        std::cout << "Specify sentiment lexicon file and sentiment output file" << endl;
+        print_usage();
+        return 0;
+    }
 
     std::cout << "MultiVec-bi" << std::endl;
     config.print();
 
     if (!train_src_file.empty() && !train_trg_file.empty()) {
-        model.train(train_src_file, train_trg_file, load_file.empty());
+        
+//	if (config.comparable) {
+//	model.trainComparable(train_src_file, train_trg_file, load_file.empty());
+//	} else{
+	model.train(train_src_file, train_trg_file, load_file.empty());
+//	}
     }
 
     if(!save_file.empty()) {
@@ -130,6 +160,10 @@ int main(int argc, char **argv) {
     }
     if(!save_trg_file.empty()) {
         model.trg_model.save(save_trg_file);
+    }
+    if (config.learn_sentiment) {
+        std::cout << "Saving sentiment vectors" << endl;
+        model.saveSentimentVectors(save_sent_file, sentiment_policy);
     }
 
     return 0;
