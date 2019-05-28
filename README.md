@@ -1,5 +1,5 @@
 # MultiVec
-C++ implementation of *word2vec*, *bivec*, and *paragraph vector*.
+C++ implementation of *word2vec*, *bivec*, and *paragraph vector*. Extended to provide support for training monolingual and bilingual sentiment embeddings.
 
 ## Features
 
